@@ -1,0 +1,18 @@
+{
+  "total_timesteps": 1200000,
+  "num_envs": 8,
+  "num_steps": 256,
+  "learning_rate": 0.0001,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "update_epochs": 4,
+  "minibatch_size": 512,
+  "clip_coef": 0.15,
+  "value_clip_coef": 0.2,
+  "ent_coef": 0.004,
+  "vf_coef": 0.35,
+  "max_grad_norm": 0.5,
+  "target_kl": 0.01,
+  "eval_interval": 10,
+  "eval_episodes": 8
+}

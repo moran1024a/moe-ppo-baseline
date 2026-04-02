@@ -1,0 +1,31 @@
+{
+  "algo": "moe_ppo_baseline_v3_scene_guided",
+  "version": "v3",
+  "expert_names": [
+    "global_clean",
+    "local_avoid",
+    "return_dock"
+  ],
+  "total_timesteps": 1200000,
+  "num_envs": 8,
+  "num_steps": 256,
+  "learning_rate": 0.0001,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "update_epochs": 4,
+  "minibatch_size": 512,
+  "clip_coef": 0.15,
+  "value_clip_coef": 0.2,
+  "ent_coef": 0.004,
+  "vf_coef": 0.35,
+  "max_grad_norm": 0.5,
+  "target_kl": 0.01,
+  "gate_balance_coef": 0.03,
+  "gate_entropy_coef": 0.003,
+  "gate_guidance_coef": 0.02,
+  "avoid_ray_threshold": 0.18,
+  "avoid_map_density_threshold": 0.2,
+  "dock_visible_battery_margin": 0.08,
+  "eval_interval": 10,
+  "eval_episodes": 8
+}

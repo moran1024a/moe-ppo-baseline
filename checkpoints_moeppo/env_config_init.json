@@ -1,0 +1,128 @@
+{
+  "robot": {
+    "radius": 12.0,
+    "max_linear_speed": 90.0,
+    "max_angular_speed": 2.8,
+    "battery_capacity": 1000.0,
+    "battery_per_step": 1.0,
+    "battery_move_scale": 0.6,
+    "cleaning_radius": 20.0,
+    "dock_recharge_rate": 10.0,
+    "low_battery_threshold": 0.25,
+    "critical_battery_threshold": 0.12,
+    "spawn_safe_radius": 100.0
+  },
+  "map_cfg": {
+    "width": 900,
+    "height": 650,
+    "border_thickness": 8,
+    "clean_grid_size": 20,
+    "obstacle_count_range": [
+      4,
+      8
+    ],
+    "obstacle_min_size": [
+      60,
+      50
+    ],
+    "obstacle_max_size": [
+      140,
+      120
+    ],
+    "obstacle_margin": 24,
+    "dock_size": 34,
+    "dock_pos": [
+      60,
+      60
+    ],
+    "dock_safe_clearance": 72,
+    "min_cleanable_ratio": 0.5,
+    "max_obstacle_ratio": 0.42,
+    "min_reachable_ratio_from_dock": 0.75,
+    "require_dock_reachable_component": true,
+    "require_spawn_reachable_to_dock": true
+  },
+  "sensor": {
+    "num_rays": 21,
+    "ray_max_distance": 180.0,
+    "ray_fov_deg": 220.0,
+    "ray_step": 4.0,
+    "local_map_size": 11,
+    "use_local_dock_map": true,
+    "front_ray_half_span": 2,
+    "dynamic_hit_distance_ratio": 0.35
+  },
+  "dynamic_obstacle": {
+    "enabled": true,
+    "count_range": [
+      2,
+      4
+    ],
+    "radius_range": [
+      10,
+      16
+    ],
+    "speed_range": [
+      25.0,
+      55.0
+    ],
+    "max_try_spawn": 300,
+    "dock_avoid_radius": 70.0,
+    "robot_avoid_radius": 100.0,
+    "pair_safe_gap": 8.0
+  },
+  "reward": {
+    "step_penalty": -0.02,
+    "new_clean_cell_reward": 1.0,
+    "coverage_gain_reward": 12.0,
+    "collision_static_penalty": -15.0,
+    "collision_dynamic_penalty": -18.0,
+    "battery_empty_penalty": -20.0,
+    "low_battery_to_dock_progress_reward": 8.0,
+    "low_battery_away_from_dock_penalty": -0.08,
+    "dock_contact_reward": 1.5,
+    "recharge_reward_scale": 0.1,
+    "low_battery_return_success_bonus": 10.0,
+    "non_low_battery_dock_penalty": -0.3,
+    "high_battery_dock_penalty": -0.8,
+    "high_battery_threshold_for_dock_penalty": 0.6,
+    "low_battery_clean_reward_scale": 0.2,
+    "idle_linear_speed_ratio_threshold": 0.08,
+    "idle_angular_speed_ratio_threshold": 0.08,
+    "idle_step_threshold": 18,
+    "idle_penalty": -0.25,
+    "no_progress_step_threshold": 28,
+    "no_progress_penalty": -0.4,
+    "dock_idle_step_threshold": 12,
+    "dock_idle_penalty": -0.6,
+    "early_stage_coverage_threshold": 0.08,
+    "early_stage_dock_penalty": -0.5,
+    "full_clean_bonus": 25.0,
+    "timeout_penalty": -3.0,
+    "reward_scale": 0.1
+  },
+  "render": {
+    "render_fps": 30,
+    "window_caption": "Cleaning Robot Multi-Task Env",
+    "draw_grid": true,
+    "draw_status_text": true,
+    "draw_rays": true,
+    "draw_local_patch_outline": false
+  },
+  "curriculum": {
+    "easy_dynamic_enabled": false,
+    "mid_dynamic_enabled": false,
+    "full_dynamic_enabled": true,
+    "easy_battery_capacity_scale": 1.35,
+    "mid_battery_capacity_scale": 1.1,
+    "full_battery_capacity_scale": 1.0,
+    "easy_obstacle_scale": 0.7,
+    "mid_obstacle_scale": 0.9,
+    "full_obstacle_scale": 1.0
+  },
+  "dt": 0.1,
+  "max_steps": 2200,
+  "seed": 42,
+  "training_mode": "baseline_easy",
+  "use_dict_observation": true
+}
