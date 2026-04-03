@@ -4,8 +4,8 @@ from typing import Tuple
 
 @dataclass
 class MapConfig:
-    width: int = 640
-    height: int = 640
+    width: int = 1280
+    height: int = 1280
     border_thickness: int = 8
 
     clean_grid_size: int = 16
@@ -20,13 +20,37 @@ class MapConfig:
     block_min_size: Tuple[int, int] = (40, 40)
     block_max_size: Tuple[int, int] = (90, 90)
 
-    # 墙体障碍尺寸（长条）
+    # 墙体障碍尺寸
     wall_thickness_range: Tuple[int, int] = (16, 28)
     wall_length_range: Tuple[int, int] = (120, 220)
 
     obstacle_margin: int = 18
     dock_safe_clearance: int = 72
     min_cleanable_ratio: float = 0.60
+
+
+@dataclass
+class DirtConfig:
+    enabled: bool = True
+
+    # 污渍聚落数量
+    cluster_count_range: Tuple[int, int] = (4, 8)
+
+    # 聚落半径（单位：grid cell）
+    cluster_radius_range: Tuple[int, int] = (4, 9)
+
+    # 聚落密度，整体提高
+    cluster_density_range: Tuple[float, float] = (0.72, 0.95)
+
+    # 距离 dock 的安全距离（像素）
+    spawn_safe_distance_to_dock: float = 120.0
+
+    # 总污渍占可通行区域比例
+    min_dirty_ratio: float = 0.12
+    max_dirty_ratio: float = 0.40
+
+    # 生成重试次数
+    max_retry: int = 60
 
 
 @dataclass
@@ -45,10 +69,9 @@ class RobotConfig:
     radius: float = 14.0
     cleaning_radius: float = 24.0
 
-    # 运动：加速度模型
+    # 加速度模型
     max_linear_speed: float = 80.0
     max_angular_speed: float = 2.4
-
     max_linear_acc: float = 120.0
     max_angular_acc: float = 4.0
 
@@ -61,7 +84,7 @@ class RobotConfig:
     battery_move_scale: float = 0.10
     battery_turn_scale: float = 0.04
 
-    charge_rate: float = 0.55   # 明显快于消耗
+    charge_rate: float = 0.55
     low_battery_threshold: float = 0.22
 
 
@@ -77,33 +100,34 @@ class SensorConfig:
 
 @dataclass
 class RewardConfig:
-    step_penalty: float = -0.003
+    step_penalty: float = -0.005
 
-    new_clean_cell_reward: float = 0.22
-    coverage_gain_reward: float = 6.0
+    # 主奖励：只针对污渍清扫
+    new_clean_cell_reward: float = 0.45
 
-    # 鼓励朝未清扫区域推进
-    unclean_frontier_reward: float = 0.08
+    # 探索奖励适当减弱
+    first_visit_reward: float = 0.02
 
-    # 平均清扫效率：coverage / step
-    efficiency_reward_scale: float = 10.0
+    # 重复覆盖轻微惩罚
+    revisit_penalty: float = -0.012
 
-    # 回桩奖励：剩余电量越少越高
-    dock_return_base_reward: float = 0.5
-    dock_return_low_battery_bonus: float = 1.8
+    # 新增：首次看到未清扫污渍
+    discover_dirt_reward: float = 0.05
 
-    # 过早回桩惩罚
-    early_dock_penalty: float = -0.25
+    # 回桩
+    dock_return_base_reward: float = 0.10
+    dock_return_low_battery_bonus: float = 0.35
+    early_dock_penalty: float = -0.08
 
-    # 充电等待
+    # 电量耗尽
+    out_of_power_penalty: float = -5.0
+
+    # 充电等待成本
     charging_wait_reward: float = -0.001
 
-    # 成功
-    success_reward: float = 6.0
-
-    # 失败
+    # 失败惩罚
     collision_penalty: float = -4.0
-    timeout_penalty: float = -2.0
+    timeout_penalty: float = 0.0
 
     reward_scale: float = 1.0
 
@@ -123,14 +147,15 @@ class EnvConfig:
     dt: float = 0.10
     max_steps: int = 2200
 
-    target_coverage: float = 0.80
     use_dict_observation: bool = True
 
     # easy / medium / hard
     difficulty: str = "medium"
 
     map_cfg: MapConfig = field(default_factory=MapConfig)
-    dynamic_obstacle: DynamicObstacleConfig = field(default_factory=DynamicObstacleConfig)
+    dirt: DirtConfig = field(default_factory=DirtConfig)
+    dynamic_obstacle: DynamicObstacleConfig = field(
+        default_factory=DynamicObstacleConfig)
     robot: RobotConfig = field(default_factory=RobotConfig)
     sensor: SensorConfig = field(default_factory=SensorConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)

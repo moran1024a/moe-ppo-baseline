@@ -34,15 +34,15 @@ class CleaningRobotEnv(gym.Env):
     - medium : 静态障碍物
     - hard   : 静态 + 动态障碍物
 
-    核心规则：
+    规则：
     - 初始从 dock 出发，满电
     - 动作是线加速度 + 角加速度
-    - 回到 dock 的奖励与剩余电量负相关
     - 回到 dock 后必须充满电，充满后自动重置到 dock 中心
-    - 达到 target_coverage 后，再次回 dock 则成功结束
+    - 不再因 coverage 达标提前结束
     - 撞静态障碍、动态障碍、边界：结束
     - 超时：结束
-    - 机器人只有局部视野，射线能看到障碍物和未清扫区域
+    - 射线可看到障碍物和未清扫污渍
+    - 污渍不是全图，而是随机生成的聚落
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -63,15 +63,17 @@ class CleaningRobotEnv(gym.Env):
 
         self._np_random: Optional[np.random.Generator] = None
 
-        xs = np.arange(self.grid_w, dtype=np.float32) * self.grid + self.grid * 0.5
-        ys = np.arange(self.grid_h, dtype=np.float32) * self.grid + self.grid * 0.5
+        xs = np.arange(self.grid_w, dtype=np.float32) * \
+            self.grid + self.grid * 0.5
+        ys = np.arange(self.grid_h, dtype=np.float32) * \
+            self.grid + self.grid * 0.5
         self.cell_center_x, self.cell_center_y = np.meshgrid(xs, ys)
         self.grid_x_idx, self.grid_y_idx = np.meshgrid(
             np.arange(self.grid_w, dtype=np.int32),
             np.arange(self.grid_h, dtype=np.int32),
         )
 
-        # 动作：线加速度控制 + 角加速度控制
+        # 动作：线加速度 + 角加速度
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
@@ -81,14 +83,12 @@ class CleaningRobotEnv(gym.Env):
         # state:
         # [x/W, y/H, cos(theta), sin(theta),
         #  v/vmax, w/wmax,
-        #  battery_ratio, coverage,
-        #  target_coverage_reached,
+        #  battery_ratio,
         #  on_dock, charging_locked,
         #  dock_dx_norm, dock_dy_norm, dock_dist_norm,
         #  front_obstacle_dist, min_obstacle_dist,
-        #  front_unclean_dist, min_unclean_dist,
-        #  efficiency]
-        self.state_dim = 19
+        #  front_unclean_dist, min_unclean_dist]
+        self.state_dim = 16
 
         local_size = self.cfg.sensor.local_map_size
         ray_shape = (self.cfg.sensor.num_rays, 5)
@@ -102,8 +102,11 @@ class CleaningRobotEnv(gym.Env):
                 "local_obstacle_map": spaces.Box(low=0.0, high=1.0, shape=(local_size, local_size), dtype=np.float32),
             })
         else:
-            flat_dim = self.state_dim + self.cfg.sensor.num_rays * 5 + local_size * local_size * 2
-            self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(flat_dim,), dtype=np.float32)
+            flat_dim = self.state_dim + self.cfg.sensor.num_rays * \
+                5 + local_size * local_size * 2
+            self.observation_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(flat_dim,), dtype=np.float32
+            )
 
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -113,21 +116,28 @@ class CleaningRobotEnv(gym.Env):
         self.battery = 0.0
 
         self.steps = 0
+
+        # clean_map: 已清扫污渍
+        # dirt_map : 初始污渍区域
         self.clean_map = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
-        self.obstacle_map = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+        self.dirt_map = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+        self.visit_map = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+        self.obstacle_map = np.zeros(
+            (self.grid_h, self.grid_w), dtype=np.float32)
 
         self.total_cleanable_cells = 0
+        self.total_dirty_cells = 0
+
         self.obstacles: List[RectObstacle] = []
         self.dynamic_obstacles: List[DynamicObstacle] = []
         self.dock_rect: Optional[pygame.Rect] = None
 
-        self.prev_coverage = 0.0
-        self.coverage_goal_reached = False
-        self.charging_locked = False
         self.last_done_reason: Optional[str] = None
-
         self.last_ray_hits: Optional[np.ndarray] = None
         self.last_ray_summary: Dict[str, float] = {}
+
+        self.charging_locked = False
+        self.prev_seen_unclean = False
 
         self.window = None
         self.clock = None
@@ -225,9 +235,6 @@ class CleaningRobotEnv(gym.Env):
                 return True
         return False
 
-    def _cell_is_cleanable(self, gx: int, gy: int) -> bool:
-        return 0 <= gx < self.grid_w and 0 <= gy < self.grid_h and self.obstacle_map[gy, gx] < 0.5
-
     def _difficulty(self) -> str:
         mode = str(self.cfg.difficulty).lower()
         if mode not in {"easy", "medium", "hard"}:
@@ -244,7 +251,9 @@ class CleaningRobotEnv(gym.Env):
             return
 
         mcfg = self.cfg.map_cfg
-        dock_avoid = self.dock_rect.inflate(mcfg.dock_safe_clearance * 2, mcfg.dock_safe_clearance * 2)
+        dock_avoid = self.dock_rect.inflate(
+            mcfg.dock_safe_clearance * 2, mcfg.dock_safe_clearance * 2
+        )
 
         def valid_rect(candidate: pygame.Rect) -> bool:
             bt = mcfg.border_thickness
@@ -256,23 +265,26 @@ class CleaningRobotEnv(gym.Env):
                 return False
             for obs in self.obstacles:
                 if candidate.inflate(mcfg.obstacle_margin, mcfg.obstacle_margin).colliderect(
-                    obs.rect.inflate(mcfg.obstacle_margin, mcfg.obstacle_margin)
+                    obs.rect.inflate(mcfg.obstacle_margin,
+                                     mcfg.obstacle_margin)
                 ):
                     return False
             return True
 
-        # medium / hard 都有静态障碍
         b_lo, b_hi = mcfg.block_obstacle_count_range
         block_n = int(self._np_random.integers(b_lo, b_hi + 1))
         for _ in range(block_n):
             for _ in range(200):
-                w = int(self._np_random.integers(mcfg.block_min_size[0], mcfg.block_max_size[0] + 1))
-                h = int(self._np_random.integers(mcfg.block_min_size[1], mcfg.block_max_size[1] + 1))
+                w = int(self._np_random.integers(
+                    mcfg.block_min_size[0], mcfg.block_max_size[0] + 1))
+                h = int(self._np_random.integers(
+                    mcfg.block_min_size[1], mcfg.block_max_size[1] + 1))
                 x = int(self._np_random.integers(20, max(21, self.W - w - 20)))
                 y = int(self._np_random.integers(20, max(21, self.H - h - 20)))
                 rect = pygame.Rect(x, y, w, h)
                 if valid_rect(rect):
-                    self.obstacles.append(RectObstacle(rect=rect, kind="block"))
+                    self.obstacles.append(
+                        RectObstacle(rect=rect, kind="block"))
                     break
 
         w_lo, w_hi = mcfg.wall_obstacle_count_range
@@ -289,15 +301,19 @@ class CleaningRobotEnv(gym.Env):
 
                 if horizontal:
                     rect = pygame.Rect(
-                        int(self._np_random.integers(20, max(21, self.W - length - 20))),
-                        int(self._np_random.integers(20, max(21, self.H - thickness - 20))),
+                        int(self._np_random.integers(
+                            20, max(21, self.W - length - 20))),
+                        int(self._np_random.integers(
+                            20, max(21, self.H - thickness - 20))),
                         length,
                         thickness,
                     )
                 else:
                     rect = pygame.Rect(
-                        int(self._np_random.integers(20, max(21, self.W - thickness - 20))),
-                        int(self._np_random.integers(20, max(21, self.H - length - 20))),
+                        int(self._np_random.integers(
+                            20, max(21, self.W - thickness - 20))),
+                        int(self._np_random.integers(
+                            20, max(21, self.H - length - 20))),
                         thickness,
                         length,
                     )
@@ -322,7 +338,6 @@ class CleaningRobotEnv(gym.Env):
             )
             self.obstacle_map[overlap] = 1.0
 
-        # dock 区域可通行
         dl = self.dock_rect.left
         dt = self.dock_rect.top
         dr = self.dock_rect.right
@@ -336,7 +351,8 @@ class CleaningRobotEnv(gym.Env):
         self.total_cleanable_cells = int((self.obstacle_map < 0.5).sum())
 
     def _map_is_valid(self) -> bool:
-        free_ratio = float((self.obstacle_map < 0.5).sum()) / float(self.grid_h * self.grid_w)
+        free_ratio = float((self.obstacle_map < 0.5).sum()) / \
+            float(self.grid_h * self.grid_w)
         return free_ratio >= self.cfg.map_cfg.min_cleanable_ratio
 
     def _build_valid_map(self, max_retry: int = 60) -> None:
@@ -346,6 +362,121 @@ class CleaningRobotEnv(gym.Env):
             if self._map_is_valid():
                 return
         self._build_obstacle_map()
+
+    # =========================================================
+    # 污渍聚落
+    # =========================================================
+    def _free_cell_mask(self) -> np.ndarray:
+        free_mask = (self.obstacle_map < 0.5).astype(np.float32)
+
+        left = self.grid_x_idx * self.grid
+        top = self.grid_y_idx * self.grid
+        right = left + self.grid
+        bottom = top + self.grid
+
+        dl = self.dock_rect.left
+        dt = self.dock_rect.top
+        dr = self.dock_rect.right
+        db = self.dock_rect.bottom
+        dock_overlap = (
+            (right > dl) & (left < dr) &
+            (bottom > dt) & (top < db)
+        )
+
+        free_mask[dock_overlap] = 0.0
+        return free_mask
+
+    def _build_dirt_map(self) -> None:
+        self.dirt_map.fill(0.0)
+
+        if not self.cfg.dirt.enabled:
+            self.total_dirty_cells = 0
+            return
+
+        dcfg = self.cfg.dirt
+        free_mask = self._free_cell_mask() > 0.5
+        free_indices = np.argwhere(free_mask)
+
+        if len(free_indices) == 0:
+            self.total_dirty_cells = 0
+            return
+
+        dock_cx = self.dock_rect.centerx
+        dock_cy = self.dock_rect.centery
+
+        def valid_cluster_center(gy: int, gx: int) -> bool:
+            cx = (gx + 0.5) * self.grid
+            cy = (gy + 0.5) * self.grid
+            return math.hypot(cx - dock_cx, cy - dock_cy) >= dcfg.spawn_safe_distance_to_dock
+
+        success = False
+        for _ in range(dcfg.max_retry):
+            self.dirt_map.fill(0.0)
+
+            cluster_count = int(self._np_random.integers(
+                dcfg.cluster_count_range[0], dcfg.cluster_count_range[1] + 1
+            ))
+
+            valid_centers = [
+                (gy, gx) for gy, gx in free_indices
+                if valid_cluster_center(int(gy), int(gx))
+            ]
+
+            if len(valid_centers) == 0:
+                break
+
+            for _ in range(cluster_count):
+                center_idx = int(
+                    self._np_random.integers(0, len(valid_centers)))
+                cy, cx = valid_centers[center_idx]
+
+                radius = int(self._np_random.integers(
+                    dcfg.cluster_radius_range[0], dcfg.cluster_radius_range[1] + 1
+                ))
+                density = float(self._np_random.uniform(
+                    dcfg.cluster_density_range[0], dcfg.cluster_density_range[1]
+                ))
+
+                y0 = max(0, cy - radius)
+                y1 = min(self.grid_h, cy + radius + 1)
+                x0 = max(0, cx - radius)
+                x1 = min(self.grid_w, cx + radius + 1)
+
+                for gy in range(y0, y1):
+                    for gx in range(x0, x1):
+                        if not free_mask[gy, gx]:
+                            continue
+
+                        dy = gy - cy
+                        dx = gx - cx
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        if dist > radius:
+                            continue
+
+                        # 中心更密，边缘略稀
+                        dist_norm = dist / max(radius, 1e-6)
+                        prob = density * (1.0 - 0.55 * dist_norm)
+
+                        # 少量噪声，让形状更自然
+                        prob += float(self._np_random.uniform(-0.05, 0.05))
+                        prob = float(np.clip(prob, 0.0, 1.0))
+
+                        if self._np_random.random() < prob:
+                            self.dirt_map[gy, gx] = 1.0
+
+            self.dirt_map[~free_mask] = 0.0
+
+            dirty_cells = int(self.dirt_map.sum())
+            dirty_ratio = dirty_cells / max(int(free_mask.sum()), 1)
+
+            if dcfg.min_dirty_ratio <= dirty_ratio <= dcfg.max_dirty_ratio:
+                success = True
+                break
+
+        if not success:
+            self.dirt_map[~free_mask] = 0.0
+
+        self.total_dirty_cells = int(self.dirt_map.sum())
 
     # =========================================================
     # 动态障碍
@@ -359,12 +490,15 @@ class CleaningRobotEnv(gym.Env):
             return
 
         dcfg = self.cfg.dynamic_obstacle
-        count = int(self._np_random.integers(dcfg.count_range[0], dcfg.count_range[1] + 1))
+        count = int(self._np_random.integers(
+            dcfg.count_range[0], dcfg.count_range[1] + 1))
 
         for _ in range(count):
             for _ in range(dcfg.max_try_spawn):
-                radius = float(self._np_random.integers(dcfg.radius_range[0], dcfg.radius_range[1] + 1))
-                speed = float(self._np_random.uniform(dcfg.speed_range[0], dcfg.speed_range[1]))
+                radius = float(self._np_random.integers(
+                    dcfg.radius_range[0], dcfg.radius_range[1] + 1))
+                speed = float(self._np_random.uniform(
+                    dcfg.speed_range[0], dcfg.speed_range[1]))
                 angle = float(self._np_random.uniform(-math.pi, math.pi))
                 x = float(self._np_random.uniform(50, self.W - 50))
                 y = float(self._np_random.uniform(50, self.H - 50))
@@ -439,18 +573,25 @@ class CleaningRobotEnv(gym.Env):
                     ny = obs.y + obs.vy * self.dt
                     break
 
-            obs.x = float(np.clip(nx, bt + obs.radius, self.W - bt - obs.radius))
-            obs.y = float(np.clip(ny, bt + obs.radius, self.H - bt - obs.radius))
+            obs.x = float(np.clip(nx, bt + obs.radius,
+                          self.W - bt - obs.radius))
+            obs.y = float(np.clip(ny, bt + obs.radius,
+                          self.H - bt - obs.radius))
 
     # =========================================================
-    # 清扫 / 感知
+    # 清扫 / 探索 / 感知
     # =========================================================
     def _mark_cleaned(self) -> Tuple[int, int]:
         radius = self.cfg.robot.cleaning_radius
         rr = radius * radius
         dx = self.cell_center_x - self.robot_x
         dy = self.cell_center_y - self.robot_y
-        mask = (dx * dx + dy * dy <= rr) & (self.obstacle_map < 0.5)
+
+        mask = (
+            (dx * dx + dy * dy <= rr) &
+            (self.obstacle_map < 0.5) &
+            (self.dirt_map > 0.5)
+        )
 
         newly_cleaned_mask = mask & (self.clean_map < 0.5)
         revisited_mask = mask & (self.clean_map > 0.5)
@@ -461,18 +602,34 @@ class CleaningRobotEnv(gym.Env):
         self.clean_map[newly_cleaned_mask] = 1.0
         return new_clean, revisited
 
+    def _mark_visited(self) -> int:
+        gx = int(np.clip(int(self.robot_x // self.grid), 0, self.grid_w - 1))
+        gy = int(np.clip(int(self.robot_y // self.grid), 0, self.grid_h - 1))
+
+        if self.obstacle_map[gy, gx] > 0.5:
+            return 0
+
+        first_visit = 1 if self.visit_map[gy, gx] < 0.5 else 0
+        self.visit_map[gy, gx] = 1.0
+        return first_visit
+
     def _coverage(self) -> float:
-        if self.total_cleanable_cells <= 0:
+        if self.total_dirty_cells <= 0:
             return 0.0
-        cleaned = np.logical_and(self.clean_map > 0.5, self.obstacle_map < 0.5).sum()
-        return float(cleaned / self.total_cleanable_cells)
+        cleaned = np.logical_and(self.clean_map > 0.5,
+                                 self.dirt_map > 0.5).sum()
+        return float(cleaned / self.total_dirty_cells)
 
     def _point_unclean(self, x: float, y: float) -> bool:
         if x < 0 or x >= self.W or y < 0 or y >= self.H:
             return False
         gx = int(np.clip(int(x // self.grid), 0, self.grid_w - 1))
         gy = int(np.clip(int(y // self.grid), 0, self.grid_h - 1))
-        return (self.obstacle_map[gy, gx] < 0.5) and (self.clean_map[gy, gx] < 0.5)
+        return (
+            (self.obstacle_map[gy, gx] < 0.5) and
+            (self.dirt_map[gy, gx] > 0.5) and
+            (self.clean_map[gy, gx] < 0.5)
+        )
 
     def _cast_rays(self) -> np.ndarray:
         num_rays = self.cfg.sensor.num_rays
@@ -485,7 +642,8 @@ class CleaningRobotEnv(gym.Env):
         if num_rays == 1:
             angles = np.array([self.robot_theta], dtype=np.float32)
         else:
-            angles = np.linspace(self.robot_theta - fov / 2.0, self.robot_theta + fov / 2.0, num_rays)
+            angles = np.linspace(self.robot_theta - fov /
+                                 2.0, self.robot_theta + fov / 2.0, num_rays)
 
         for i, angle in enumerate(angles):
             obs_dist = max_dist
@@ -542,14 +700,11 @@ class CleaningRobotEnv(gym.Env):
         if np.any(rays[:, 4] > 0.5):
             min_unclean = float(np.min(rays[rays[:, 4] > 0.5, 3]))
 
-        front_has_dynamic = 1.0 if np.any(front[:, 2] > 0.5) else 0.0
-
         return {
             "front_obstacle_dist": front_obs,
             "min_obstacle_dist": min_obs,
             "front_unclean_dist": front_unclean,
             "min_unclean_dist": min_unclean,
-            "front_has_dynamic": front_has_dynamic,
         }
 
     def _extract_local_patch(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -571,8 +726,10 @@ class CleaningRobotEnv(gym.Env):
         x1_dst = x0_dst + (x1_src - x0_src)
         y1_dst = y0_dst + (y1_src - y0_src)
 
-        clean_patch[y0_dst:y1_dst, x0_dst:x1_dst] = self.clean_map[y0_src:y1_src, x0_src:x1_src]
-        obstacle_patch[y0_dst:y1_dst, x0_dst:x1_dst] = self.obstacle_map[y0_src:y1_src, x0_src:x1_src]
+        clean_patch[y0_dst:y1_dst,
+                    x0_dst:x1_dst] = self.clean_map[y0_src:y1_src, x0_src:x1_src]
+        obstacle_patch[y0_dst:y1_dst,
+                       x0_dst:x1_dst] = self.obstacle_map[y0_src:y1_src, x0_src:x1_src]
 
         for obs in self.dynamic_obstacles:
             ogx = int(obs.x // self.grid)
@@ -584,19 +741,15 @@ class CleaningRobotEnv(gym.Env):
 
         return clean_patch, obstacle_patch
 
-    def _efficiency(self, coverage: float) -> float:
-        if self.steps <= 0:
-            return 0.0
-        return float(coverage / self.steps)
-
     def _get_state_vector(self) -> np.ndarray:
-        coverage = self._coverage()
-        battery_ratio = self.battery / max(self.cfg.robot.battery_capacity, 1e-6)
+        battery_ratio = self.battery / \
+            max(self.cfg.robot.battery_capacity, 1e-6)
         dock_dx, dock_dy = self._dock_direction(self.robot_x, self.robot_y)
         dock_dx_norm = float(np.clip(dock_dx / max(self.W, 1), -1.0, 1.0))
         dock_dy_norm = float(np.clip(dock_dy / max(self.H, 1), -1.0, 1.0))
         dock_dist_norm = float(np.clip(
-            math.hypot(dock_dx, dock_dy) / max(math.hypot(self.W, self.H), 1e-6), 0.0, 1.0
+            math.hypot(dock_dx, dock_dy) /
+            max(math.hypot(self.W, self.H), 1e-6), 0.0, 1.0
         ))
 
         summary = self.last_ray_summary if self.last_ray_summary else {
@@ -604,7 +757,6 @@ class CleaningRobotEnv(gym.Env):
             "min_obstacle_dist": 1.0,
             "front_unclean_dist": 1.0,
             "min_unclean_dist": 1.0,
-            "front_has_dynamic": 0.0,
         }
 
         state = np.array([
@@ -615,8 +767,6 @@ class CleaningRobotEnv(gym.Env):
             self.robot_v / max(self.cfg.robot.max_linear_speed, 1e-6),
             self.robot_w / max(self.cfg.robot.max_angular_speed, 1e-6),
             battery_ratio,
-            coverage,
-            1.0 if self.coverage_goal_reached else 0.0,
             1.0 if self._robot_on_dock() else 0.0,
             1.0 if self.charging_locked else 0.0,
             dock_dx_norm,
@@ -626,7 +776,6 @@ class CleaningRobotEnv(gym.Env):
             summary["min_obstacle_dist"],
             summary["front_unclean_dist"],
             summary["min_unclean_dist"],
-            np.clip(self._efficiency(coverage) * 100.0, 0.0, 1.0),
         ], dtype=np.float32)
         return state
 
@@ -660,35 +809,35 @@ class CleaningRobotEnv(gym.Env):
 
         self.steps = 0
         self.clean_map.fill(0.0)
-        self.prev_coverage = 0.0
-        self.coverage_goal_reached = False
+        self.dirt_map.fill(0.0)
+        self.visit_map.fill(0.0)
         self.charging_locked = False
         self.last_done_reason = None
+        self.prev_seen_unclean = False
 
         self._build_dock()
         self._build_valid_map()
+        self._build_dirt_map()
         self._spawn_dynamic_obstacles()
 
-        # 初始从 dock 中心出发，满电
         self._reset_robot_to_dock_center()
         self.battery = self.cfg.robot.battery_capacity
 
         self._mark_cleaned()
+        self._mark_visited()
         self._cast_rays()
-
-        self.prev_coverage = self._coverage()
+        self.prev_seen_unclean = bool(np.any(self.last_ray_hits[:, 4] > 0.5))
 
         obs = self._get_obs()
         info = {
-            "coverage": self.prev_coverage,
+            "coverage": self._coverage(),
             "battery": self.battery,
             "battery_ratio": 1.0,
-            "efficiency": self._efficiency(self.prev_coverage),
-            "goal_reached": self.coverage_goal_reached,
             "on_dock": True,
-            "charging_locked": self.charging_locked,
+            "charging_locked": False,
             "difficulty": self._difficulty(),
             "dynamic_obstacles": len(self.dynamic_obstacles),
+            "dirty_cells": self.total_dirty_cells,
             "done_reason": None,
         }
 
@@ -706,21 +855,19 @@ class CleaningRobotEnv(gym.Env):
         truncated = False
         done_reason = None
 
-        prev_coverage = self.prev_coverage
-        prev_eff = self._efficiency(prev_coverage)
         prev_on_dock = self._robot_on_dock()
+        prev_seen_unclean = self.prev_seen_unclean
 
-        # 先移动动态障碍
         self._move_dynamic_obstacles()
 
         on_dock_before_move = self._robot_on_dock()
 
-        # 回桩后锁定充电
         if self.charging_locked:
             if on_dock_before_move:
                 self.robot_v = 0.0
                 self.robot_w = 0.0
-                self.battery = min(self.cfg.robot.battery_capacity, self.battery + self.cfg.robot.charge_rate)
+                self.battery = min(self.cfg.robot.battery_capacity,
+                                   self.battery + self.cfg.robot.charge_rate)
                 reward_raw += self.cfg.reward.charging_wait_reward
 
                 if self.battery >= self.cfg.robot.battery_capacity - 1e-8:
@@ -730,14 +877,12 @@ class CleaningRobotEnv(gym.Env):
             else:
                 self.charging_locked = False
         else:
-            # 加速度控制
             a_v = float(action[0]) * self.cfg.robot.max_linear_acc
             a_w = float(action[1]) * self.cfg.robot.max_angular_acc
 
             self.robot_v += a_v * self.dt
             self.robot_w += a_w * self.dt
 
-            # 阻尼，支持停下
             self.robot_v *= self.cfg.robot.linear_drag
             self.robot_w *= self.cfg.robot.angular_drag
 
@@ -752,7 +897,8 @@ class CleaningRobotEnv(gym.Env):
                 self.cfg.robot.max_angular_speed
             ))
 
-            new_theta = self._normalize_angle(self.robot_theta + self.robot_w * self.dt)
+            new_theta = self._normalize_angle(
+                self.robot_theta + self.robot_w * self.dt)
             new_x = self.robot_x + self.robot_v * math.cos(new_theta) * self.dt
             new_y = self.robot_y + self.robot_v * math.sin(new_theta) * self.dt
 
@@ -768,9 +914,10 @@ class CleaningRobotEnv(gym.Env):
                 self.robot_y = new_y
                 self.robot_theta = new_theta
 
-            # 耗电
-            move_ratio = abs(self.robot_v) / max(self.cfg.robot.max_linear_speed, 1e-6)
-            turn_ratio = abs(self.robot_w) / max(self.cfg.robot.max_angular_speed, 1e-6)
+            move_ratio = abs(self.robot_v) / \
+                max(self.cfg.robot.max_linear_speed, 1e-6)
+            turn_ratio = abs(self.robot_w) / \
+                max(self.cfg.robot.max_angular_speed, 1e-6)
             battery_cost = (
                 self.cfg.robot.battery_per_step +
                 self.cfg.robot.battery_move_scale * move_ratio +
@@ -781,82 +928,76 @@ class CleaningRobotEnv(gym.Env):
         on_dock = self._robot_on_dock()
 
         newly_cleaned, revisited = self._mark_cleaned()
-        coverage = self._coverage()
-
-        if coverage >= self.cfg.target_coverage:
-            self.coverage_goal_reached = True
+        first_visit = self._mark_visited()
 
         self._cast_rays()
         summary = self.last_ray_summary
+        cur_seen_unclean = bool(np.any(self.last_ray_hits[:, 4] > 0.5))
+        self.prev_seen_unclean = cur_seen_unclean
 
+        # 主奖励
         reward_raw += self.cfg.reward.step_penalty
         reward_raw += newly_cleaned * self.cfg.reward.new_clean_cell_reward
-        reward_raw += (coverage - prev_coverage) * self.cfg.reward.coverage_gain_reward
+        reward_raw += first_visit * self.cfg.reward.first_visit_reward
+        reward_raw += revisited * self.cfg.reward.revisit_penalty
 
-        # 鼓励朝未清扫区域推进
-        if summary["front_unclean_dist"] < 1.0:
-            reward_raw += self.cfg.reward.unclean_frontier_reward * (1.0 - summary["front_unclean_dist"])
+        # 首次发现未清扫污渍
+        if (not prev_seen_unclean) and cur_seen_unclean:
+            reward_raw += self.cfg.reward.discover_dirt_reward
 
-        # 平均清扫效率
-        cur_eff = self._efficiency(coverage)
-        reward_raw += (cur_eff - prev_eff) * self.cfg.reward.efficiency_reward_scale
-
-        # 到桩逻辑
+        # 回桩奖励
         if (not prev_on_dock) and on_dock:
-            remaining = self.battery / max(self.cfg.robot.battery_capacity, 1e-6)
+            remaining = self.battery / \
+                max(self.cfg.robot.battery_capacity, 1e-6)
 
-            if self.coverage_goal_reached:
-                reward_raw += self.cfg.reward.success_reward
-                terminated = True
-                done_reason = "success_return_after_coverage"
+            if remaining <= self.cfg.robot.low_battery_threshold:
+                low_factor = 1.0 - remaining / \
+                    max(self.cfg.robot.low_battery_threshold, 1e-6)
+                reward_raw += (
+                    self.cfg.reward.dock_return_base_reward +
+                    self.cfg.reward.dock_return_low_battery_bonus * low_factor
+                )
             else:
-                if remaining <= self.cfg.robot.low_battery_threshold:
-                    low_factor = 1.0 - remaining / max(self.cfg.robot.low_battery_threshold, 1e-6)
-                    reward_raw += (
-                        self.cfg.reward.dock_return_base_reward +
-                        self.cfg.reward.dock_return_low_battery_bonus * low_factor
-                    )
-                else:
-                    reward_raw += self.cfg.reward.early_dock_penalty * remaining
+                reward_raw += self.cfg.reward.early_dock_penalty * remaining
 
-                self.charging_locked = True
-                self.robot_v = 0.0
-                self.robot_w = 0.0
+            self.charging_locked = True
+            self.robot_v = 0.0
+            self.robot_w = 0.0
 
-        # 电量为 0 后只能停住
         if self.battery <= 0.0 and not terminated:
             self.robot_v = 0.0
             self.robot_w = 0.0
+            reward_raw += self.cfg.reward.out_of_power_penalty
+            terminated = True
+            done_reason = "out_of_power"
 
         if self.steps >= self.max_steps and not terminated:
             reward_raw += self.cfg.reward.timeout_penalty
             truncated = True
             done_reason = "timeout"
 
-        self.prev_coverage = coverage
         self.last_done_reason = done_reason
 
         reward = float(reward_raw * self.cfg.reward.reward_scale)
         obs = self._get_obs()
         info = {
-            "coverage": coverage,
-            "coverage_gain": coverage - prev_coverage,
+            "coverage": self._coverage(),
             "battery": self.battery,
             "battery_ratio": self.battery / max(self.cfg.robot.battery_capacity, 1e-6),
-            "efficiency": cur_eff,
             "steps": self.steps,
             "newly_cleaned": newly_cleaned,
             "revisited": revisited,
+            "first_visit": first_visit,
+            "seen_unclean": cur_seen_unclean,
             "on_dock": on_dock,
             "charging_locked": self.charging_locked,
-            "goal_reached": self.coverage_goal_reached,
             "front_obstacle_dist": summary["front_obstacle_dist"],
             "min_obstacle_dist": summary["min_obstacle_dist"],
             "front_unclean_dist": summary["front_unclean_dist"],
             "min_unclean_dist": summary["min_unclean_dist"],
-            "front_has_dynamic": summary["front_has_dynamic"],
             "difficulty": self._difficulty(),
             "dynamic_obstacles": len(self.dynamic_obstacles),
+            "dirty_cells": self.total_dirty_cells,
             "reward_raw": float(reward_raw),
             "reward": reward,
             "done_reason": done_reason,
@@ -891,41 +1032,50 @@ class CleaningRobotEnv(gym.Env):
             for gx in range(self.grid_w):
                 if self.obstacle_map[gy, gx] > 0.5:
                     continue
+
                 x = gx * self.grid
                 y = gy * self.grid
                 rect = pygame.Rect(x, y, self.grid, self.grid)
-                color = (205, 240, 205) if self.clean_map[gy, gx] > 0.5 else (245, 245, 245)
+
+                if self.dirt_map[gy, gx] > 0.5:
+                    color = (205, 240, 205) if self.clean_map[gy, gx] > 0.5 else (
+                        220, 190, 145)
+                else:
+                    color = (245, 245, 245)
+
                 pygame.draw.rect(self.canvas, color, rect)
+
                 if self.cfg.render.draw_grid:
                     pygame.draw.rect(self.canvas, (224, 224, 224), rect, 1)
 
-        # 边界
         bt = self.cfg.map_cfg.border_thickness
-        pygame.draw.rect(self.canvas, (50, 50, 50), pygame.Rect(0, 0, self.W, bt))
-        pygame.draw.rect(self.canvas, (50, 50, 50), pygame.Rect(0, self.H - bt, self.W, bt))
-        pygame.draw.rect(self.canvas, (50, 50, 50), pygame.Rect(0, 0, bt, self.H))
-        pygame.draw.rect(self.canvas, (50, 50, 50), pygame.Rect(self.W - bt, 0, bt, self.H))
+        pygame.draw.rect(self.canvas, (50, 50, 50),
+                         pygame.Rect(0, 0, self.W, bt))
+        pygame.draw.rect(self.canvas, (50, 50, 50),
+                         pygame.Rect(0, self.H - bt, self.W, bt))
+        pygame.draw.rect(self.canvas, (50, 50, 50),
+                         pygame.Rect(0, 0, bt, self.H))
+        pygame.draw.rect(self.canvas, (50, 50, 50),
+                         pygame.Rect(self.W - bt, 0, bt, self.H))
 
-        # 静态障碍
         for obs in self.obstacles:
             color = (90, 90, 90) if obs.kind == "block" else (70, 70, 110)
             pygame.draw.rect(self.canvas, color, obs.rect)
 
-        # dock
         pygame.draw.rect(self.canvas, (80, 150, 255), self.dock_rect)
 
-        # 动态障碍
         for obs in self.dynamic_obstacles:
-            pygame.draw.circle(self.canvas, (255, 165, 60), (int(obs.x), int(obs.y)), int(obs.radius))
+            pygame.draw.circle(self.canvas, (255, 165, 60),
+                               (int(obs.x), int(obs.y)), int(obs.radius))
 
-        # robot
         robot_pos = (int(self.robot_x), int(self.robot_y))
-        pygame.draw.circle(self.canvas, (220, 80, 80), robot_pos, int(self.cfg.robot.radius))
+        pygame.draw.circle(self.canvas, (220, 80, 80),
+                           robot_pos, int(self.cfg.robot.radius))
         hx = self.robot_x + self.cfg.robot.radius * math.cos(self.robot_theta)
         hy = self.robot_y + self.cfg.robot.radius * math.sin(self.robot_theta)
-        pygame.draw.line(self.canvas, (255, 255, 255), robot_pos, (int(hx), int(hy)), 3)
+        pygame.draw.line(self.canvas, (255, 255, 255),
+                         robot_pos, (int(hx), int(hy)), 3)
 
-        # rays
         if self.cfg.render.draw_rays and self.last_ray_hits is not None:
             num_rays = self.cfg.sensor.num_rays
             max_dist = self.cfg.sensor.ray_max_distance
@@ -960,22 +1110,24 @@ class CleaningRobotEnv(gym.Env):
                 if hit_unclean:
                     px = int(self.robot_x + unclean_dist * math.cos(angle))
                     py = int(self.robot_y + unclean_dist * math.sin(angle))
-                    pygame.draw.circle(self.canvas, (255, 180, 60), (px, py), 2)
+                    pygame.draw.circle(
+                        self.canvas, (255, 180, 60), (px, py), 2)
 
         if self.cfg.render.draw_status_text:
             coverage = self._coverage()
-            battery_ratio = self.battery / max(self.cfg.robot.battery_capacity, 1e-6)
-            eff = self._efficiency(coverage)
+            battery_ratio = self.battery / \
+                max(self.cfg.robot.battery_capacity, 1e-6)
             text = (
                 f"step={self.steps}  cov={coverage:.3f}  bat={self.battery:.1f}({battery_ratio:.2f})  "
-                f"eff={eff:.4f}  dock={int(self._robot_on_dock())}  lock={int(self.charging_locked)}  "
-                f"goal={int(self.coverage_goal_reached)}  diff={self._difficulty()}"
+                f"dock={int(self._robot_on_dock())}  lock={int(self.charging_locked)}  "
+                f"dirty={self.total_dirty_cells}  diff={self._difficulty()}"
             )
             font = pygame.font.SysFont("consolas", 18)
             self.canvas.blit(font.render(text, True, (20, 20, 20)), (10, 10))
 
             if self.last_done_reason is not None:
-                self.canvas.blit(font.render(f"done={self.last_done_reason}", True, (20, 20, 20)), (10, 34))
+                self.canvas.blit(font.render(
+                    f"done={self.last_done_reason}", True, (20, 20, 20)), (10, 34))
 
         if self.render_mode == "human":
             for event in pygame.event.get():
@@ -1007,12 +1159,15 @@ def run_random_demo(steps: int = 400, seed: int = 42, difficulty: str = "medium"
     print("reset:", info)
 
     for _ in range(steps):
-        obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+        obs, reward, terminated, truncated, info = env.step(
+            env.action_space.sample())
         if info["steps"] % 50 == 0:
             print(
                 f"step={info['steps']}, reward={reward:.3f}, cov={info['coverage']:.3f}, "
-                f"bat={info['battery']:.1f}, eff={info['efficiency']:.4f}, "
-                f"diff={info['difficulty']}, dyn={info['dynamic_obstacles']}, done={info['done_reason']}"
+                f"bat={info['battery']:.1f}, dirty={info['dirty_cells']}, "
+                f"new={info['newly_cleaned']}, revisit={info['revisited']}, "
+                f"first={info['first_visit']}, seen_unclean={int(info['seen_unclean'])}, "
+                f"diff={info['difficulty']}, done={info['done_reason']}"
             )
         if terminated or truncated:
             print("episode end:", info)
@@ -1021,4 +1176,4 @@ def run_random_demo(steps: int = 400, seed: int = 42, difficulty: str = "medium"
 
 
 if __name__ == "__main__":
-    run_random_demo(difficulty="eazy")
+    run_random_demo(difficulty="easy")
